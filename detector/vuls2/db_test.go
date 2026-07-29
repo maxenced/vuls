@@ -226,9 +226,9 @@ func Test_Ready(t *testing.T) {
 			wantMsg: "ok",
 		},
 		{
-			name:   "startup fetch in progress",
-			setup:  func() { vuls2.SetInitialInProgress() },
-			wantOK: false,
+			name:    "startup fetch in progress",
+			setup:   func() { vuls2.SetInitialInProgress() },
+			wantOK:  false,
 			wantMsg: "downloading vuls2",
 		},
 		{
