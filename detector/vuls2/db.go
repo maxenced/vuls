@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/pkg/errors"
@@ -24,28 +25,42 @@ var (
 		wd, _ := os.Getwd()
 		return filepath.Join(wd, "vuls.db")
 	}()
+
+	bgFetch backgroundFetch
 )
 
-// newDBConfig downloads or refreshes the db if due, validates its schema
-// version, and returns the session config to open it with.
-//
-// withCache decides whether the returned session carries a read cache. The
-// cache is unbounded (a sync.Map that never evicts), so it is only safe for a
-// session whose lifetime is bounded: a report run holds one per server and
-// drops it afterwards, which is what makes the cache pay off there. A session
-// that lives as long as a server process (see SharedDB) must not carry one, or
-// it accumulates every advisory and vulnerability it ever read until the
-// process is OOM-killed.
-func newDBConfig(vuls2Conf config.Vuls2Conf, noProgress, withCache bool) (*session.Config, error) {
+// backgroundFetch coordinates asynchronous DB downloads so that at most one
+// fetch runs at a time. When a request determines the DB is stale it triggers
+// a background goroutine and immediately falls through to use the current
+// (stale) DB. Subsequent requests that arrive while the fetch is in flight
+// skip the download entirely.
+type backgroundFetch struct {
+	mu          sync.Mutex
+	downloading bool
+}
+
+func newDBConfig(vuls2Conf config.Vuls2Conf, noProgress bool) (*session.Config, error) {
 	willDownload, err := shouldDownload(vuls2Conf, time.Now())
 	if err != nil {
 		return nil, xerrors.Errorf("Failed to check whether to download vuls2 db. err: %w", err)
 	}
 
 	if willDownload {
-		logging.Log.Infof("Fetching vuls2 db. repository: %s", vuls2Conf.Repository)
-		if err := fetch.Fetch(fetch.WithRepository(vuls2Conf.Repository), fetch.WithDBPath(vuls2Conf.Path), fetch.WithNoProgress(noProgress)); err != nil {
-			return nil, xerrors.Errorf("Failed to fetch vuls2 db. err: %w", err)
+		syncRequired, err := mustFetchSync(vuls2Conf.Path)
+		if err != nil {
+			return nil, xerrors.Errorf("Failed to check db state. err: %w", err)
+		}
+
+		if syncRequired {
+			// DB does not exist or has incompatible schema — must download synchronously.
+			logging.Log.Infof("Fetching vuls2 db (sync). repository: %s", vuls2Conf.Repository)
+			if err := fetch.Fetch(fetch.WithRepository(vuls2Conf.Repository), fetch.WithDBPath(vuls2Conf.Path), fetch.WithNoProgress(noProgress)); err != nil {
+				return nil, xerrors.Errorf("Failed to fetch vuls2 db. err: %w", err)
+			}
+		} else {
+			// DB exists with correct schema but is stale — trigger a background
+			// refresh and continue with the current version.
+			bgFetch.triggerAsync(vuls2Conf, noProgress)
 		}
 	}
 
@@ -86,56 +101,41 @@ func newDBConfig(vuls2Conf config.Vuls2Conf, noProgress, withCache bool) (*sessi
 	}, nil
 }
 
-// hasNewerRemote reports whether the repository holds a db other than the one on
-// disk, comparing the manifest digest that fetch recorded in the local db's
-// metadata against the digest the repository's reference resolves to now.
-//
-// shouldDownload can only tell that the local db is old enough to be worth
-// checking: it goes by timestamps, and the nightly db's LastModified is the
-// night it was built, so a db past the staleness window looks due on every
-// check until something replaces it. Downloading on that alone re-fetches
-// gigabytes on every check even when the tag has not moved. Resolving the
-// manifest costs one request, so it is worth asking before spending a download.
-func hasNewerRemote(ctx context.Context, vuls2Conf config.Vuls2Conf) (bool, error) {
+// mustFetchSync returns true when the DB cannot be used as-is and a
+// synchronous download is required: either the file does not exist, or it
+// exists but its schema version does not match the expected one.
+func mustFetchSync(dbpath string) (bool, error) {
+	if _, err := os.Stat(dbpath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return true, nil
+		}
+		return false, xerrors.Errorf("Failed to stat db. err: %w", err)
+	}
+
+	sv, err := session.SchemaVersion("boltdb")
+	if err != nil {
+		return false, xerrors.Errorf("Failed to get schema version. err: %w", err)
+	}
+
 	sesh, err := (&session.Config{
 		Type:    "boltdb",
-		Path:    vuls2Conf.Path,
+		Path:    dbpath,
 		Options: session.StorageOptions{BoltDB: &bolt.Options{ReadOnly: true}},
 	}).New()
 	if err != nil {
-		return false, xerrors.Errorf("Failed to new vuls2 db connection. path: %s, err: %w", vuls2Conf.Path, err)
+		return true, nil
 	}
-
 	if err := sesh.Storage().Open(); err != nil {
-		return false, xerrors.Errorf("Failed to open vuls2 db. path: %s, err: %w", vuls2Conf.Path, err)
+		return true, nil
 	}
 	defer sesh.Storage().Close()
 
 	metadata, err := sesh.Storage().GetMetadata()
-	if err != nil {
-		return false, xerrors.Errorf("Failed to get vuls2 db metadata. path: %s, err: %w", vuls2Conf.Path, err)
-	}
-	if metadata == nil || metadata.Digest == nil {
-		// A db that was built locally rather than fetched carries no digest, so
-		// there is nothing to compare it by and the repository's db counts as
-		// the newer one.
+	if err != nil || metadata == nil {
 		return true, nil
 	}
 
-	repo, err := remote.NewRepository(vuls2Conf.Repository)
-	if err != nil {
-		return false, xerrors.Errorf("Failed to create client for %s. err: %w", vuls2Conf.Repository, err)
-	}
-	if repo.Reference.Reference == "" {
-		return false, xerrors.Errorf("unexpected repository format. expected: %q, actual: %q", []string{"<repository>@<digest>", "<repository>:<tag>", "<repository>:<tag>@<digest>"}, vuls2Conf.Repository)
-	}
-
-	desc, err := repo.Resolve(ctx, repo.Reference.Reference)
-	if err != nil {
-		return false, xerrors.Errorf("Failed to resolve %s. err: %w", vuls2Conf.Repository, err)
-	}
-
-	return desc.Digest.String() != *metadata.Digest, nil
+	return metadata.SchemaVersion != sv, nil
 }
 
 func shouldDownload(vuls2Conf config.Vuls2Conf, now time.Time) (bool, error) {
@@ -191,4 +191,32 @@ func shouldDownload(vuls2Conf config.Vuls2Conf, now time.Time) (bool, error) {
 		return false, nil
 	}
 	return metadata.LastModified.Add(6 * time.Hour).Before(now), nil
+}
+
+// triggerAsync starts a background fetch if no download is already in progress.
+// It returns immediately in all cases — the caller continues with the current DB.
+func (bf *backgroundFetch) triggerAsync(vuls2Conf config.Vuls2Conf, noProgress bool) {
+	bf.mu.Lock()
+	if bf.downloading {
+		bf.mu.Unlock()
+		logging.Log.Infof("vuls2 db download already in progress, using current db")
+		return
+	}
+	bf.downloading = true
+	bf.mu.Unlock()
+
+	logging.Log.Infof("Fetching vuls2 db in background. repository: %s", vuls2Conf.Repository)
+	go func() {
+		defer func() {
+			bf.mu.Lock()
+			bf.downloading = false
+			bf.mu.Unlock()
+		}()
+
+		if err := fetch.Fetch(fetch.WithRepository(vuls2Conf.Repository), fetch.WithDBPath(vuls2Conf.Path), fetch.WithNoProgress(noProgress)); err != nil {
+			logging.Log.Warnf("Background vuls2 db fetch failed: %+v", err)
+		} else {
+			logging.Log.Infof("Background vuls2 db fetch completed successfully")
+		}
+	}()
 }
