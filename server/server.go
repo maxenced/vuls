@@ -48,7 +48,12 @@ func NewVulsHandler(toLocalFile bool, db *vuls2.SharedDB, maxConcurrency int) *V
 }
 
 // ServeHTTP is http handler
-func (h *VulsHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+func (h VulsHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if ok, msg := vuls2.Ready(); !ok {
+		http.Error(w, msg, http.StatusServiceUnavailable)
+		return
+	}
+
 	var err error
 	r := models.ScanResult{ScannedCves: models.VulnInfos{}}
 
