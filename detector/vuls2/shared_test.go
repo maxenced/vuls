@@ -7,8 +7,6 @@ import (
 	"testing"
 	"time"
 
-	bolt "go.etcd.io/bbolt"
-
 	"github.com/MaineK00n/vuls2/pkg/db/session"
 	"github.com/MaineK00n/vuls2/pkg/db/session/types"
 
@@ -17,7 +15,7 @@ import (
 )
 
 // newFixtureDB writes a db carrying digest as its metadata and returns its path,
-// so a test can tell two generations apart.
+// so a test can tell which db it was handed.
 func newFixtureDB(t *testing.T, digest string) string {
 	t.Helper()
 
@@ -31,24 +29,6 @@ func newFixtureDB(t *testing.T, digest string) string {
 		t.Fatalf("putMetadata() err = %v", err)
 	}
 	return path
-}
-
-// openFixtureDB opens path read-only, the way SharedDB opens a db it installs.
-func openFixtureDB(t *testing.T, path string) *session.Session {
-	t.Helper()
-
-	sesh, err := (&session.Config{
-		Type:    "boltdb",
-		Path:    path,
-		Options: session.StorageOptions{BoltDB: &bolt.Options{ReadOnly: true}},
-	}).New()
-	if err != nil {
-		t.Fatalf("session.Config.New() err = %v", err)
-	}
-	if err := sesh.Storage().Open(); err != nil {
-		t.Fatalf("Storage().Open() err = %v", err)
-	}
-	return sesh
 }
 
 // digestOf reads the db through sesh, which doubles as an is-it-still-open
@@ -66,19 +46,16 @@ func digestOf(t *testing.T, sesh *session.Session) (string, error) {
 	return *metadata.Digest, nil
 }
 
-func TestSharedDB_AcquireBeforeReady(t *testing.T) {
+func TestSharedDB_NotReadyBeforeOpen(t *testing.T) {
 	d, err := vuls2.NewSharedDB(config.Vuls2Conf{Path: newFixtureDB(t, "sha256:a"), SkipUpdate: true}, true)
 	if err != nil {
 		t.Fatalf("NewSharedDB() err = %v", err)
 	}
 
-	// A db on disk is not a db this process has open: until Reload installs one,
-	// a request has to be refused rather than made to open (or fetch) it.
+	// A db on disk is not a db this process has checked: until OpenLocal or
+	// Reload validates one, the server has nothing it can promise to serve.
 	if d.Ready() {
-		t.Errorf("Ready() = true before Reload, want false")
-	}
-	if _, _, err := d.Acquire(); err == nil {
-		t.Errorf("Acquire() err = nil before Reload, want an error")
+		t.Errorf("Ready() = true before OpenLocal, want false")
 	}
 }
 
@@ -95,18 +72,18 @@ func TestSharedDB_OpenLocal(t *testing.T) {
 	if err := d.OpenLocal(); err != nil {
 		t.Fatalf("OpenLocal() err = %v", err)
 	}
-	defer d.Close()
 
 	if !d.Ready() {
 		t.Errorf("Ready() = false after OpenLocal, want true")
 	}
 
-	sesh, release, err := d.Acquire()
+	sesh := d.Acquire()
+	defer sesh.Close()
+	inner, err := sesh.Open()
 	if err != nil {
-		t.Fatalf("Acquire() err = %v", err)
+		t.Fatalf("Open() err = %v", err)
 	}
-	defer release()
-	got, err := digestOf(t, sesh.Inner())
+	got, err := digestOf(t, inner)
 	if err != nil {
 		t.Fatalf("GetMetadata() err = %v", err)
 	}
@@ -130,6 +107,84 @@ func TestSharedDB_OpenLocalWithoutDB(t *testing.T) {
 	}
 }
 
+// TestSharedDB_AcquireCannotFetch is the guarantee that keeps multi-gigabyte
+// downloads off the request path: whatever the configured db policy, a session
+// handed to a request is barred from fetching.
+func TestSharedDB_AcquireCannotFetch(t *testing.T) {
+	// SkipUpdate false and a db stale enough that shouldDownload would say yes.
+	d, err := vuls2.NewSharedDB(config.Vuls2Conf{Path: newFixtureDB(t, "sha256:a")}, true)
+	if err != nil {
+		t.Fatalf("NewSharedDB() err = %v", err)
+	}
+
+	sesh := d.Acquire()
+	defer sesh.Close()
+	if !sesh.SkipsUpdate() {
+		t.Errorf("Acquire() session SkipUpdate = false, want the request path barred from fetching")
+	}
+
+	// It still opens the stale db, so a request is served rather than refused
+	// while the refresher catches up. Reaching the registry would fail this
+	// test by hanging or erroring instead.
+	if _, err := sesh.Open(); err != nil {
+		t.Errorf("Open() err = %v, want the stale db to be served", err)
+	}
+}
+
+// TestSharedDB_AcquireCarriesCache is what this whole shape exists for: an
+// unshared handle is only worth having because it can carry a read cache, and
+// enrichment measured ~60x slower without one.
+func TestSharedDB_AcquireCarriesCache(t *testing.T) {
+	d, err := vuls2.NewSharedDB(config.Vuls2Conf{Path: newFixtureDB(t, "sha256:a"), SkipUpdate: true}, true)
+	if err != nil {
+		t.Fatalf("NewSharedDB() err = %v", err)
+	}
+
+	sesh := d.Acquire()
+	defer sesh.Close()
+	inner, err := sesh.Open()
+	if err != nil {
+		t.Fatalf("Open() err = %v", err)
+	}
+	if inner.Cache() == nil {
+		t.Errorf("Acquire() session Cache() = nil, want a per-request read cache")
+	}
+}
+
+// TestSharedDB_AcquireIsIndependent checks that one request finishing does not
+// take the db away from another: each holds its own handle.
+func TestSharedDB_AcquireIsIndependent(t *testing.T) {
+	d, err := vuls2.NewSharedDB(config.Vuls2Conf{Path: newFixtureDB(t, "sha256:a"), SkipUpdate: true}, true)
+	if err != nil {
+		t.Fatalf("NewSharedDB() err = %v", err)
+	}
+	if err := d.OpenLocal(); err != nil {
+		t.Fatalf("OpenLocal() err = %v", err)
+	}
+
+	first := d.Acquire()
+	firstInner, err := first.Open()
+	if err != nil {
+		t.Fatalf("Open() err = %v", err)
+	}
+	second := d.Acquire()
+	defer second.Close()
+	secondInner, err := second.Open()
+	if err != nil {
+		t.Fatalf("second Open() err = %v", err)
+	}
+
+	first.Close()
+	if _, err := digestOf(t, secondInner); err != nil {
+		t.Errorf("GetMetadata() after the other request closed err = %v, want this db to stay open", err)
+	}
+	// The one that did close is closed, so a request does not leak its handle
+	// for the rest of the process's life.
+	if _, err := digestOf(t, firstInner); err == nil {
+		t.Errorf("GetMetadata() on the closed db err = nil, want it to be closed")
+	}
+}
+
 func TestSharedDB_Prepare(t *testing.T) {
 	// A db on disk is enough to be ready, so Prepare returns without reaching
 	// the registry even though this db is stale enough for a refresh to be due.
@@ -140,7 +195,6 @@ func TestSharedDB_Prepare(t *testing.T) {
 	if err := d.Prepare(context.Background(), time.Minute); err != nil {
 		t.Fatalf("Prepare() err = %v", err)
 	}
-	defer d.Close()
 
 	if !d.Ready() {
 		t.Errorf("Ready() = false after Prepare, want true")
@@ -173,97 +227,29 @@ func TestSharedDB_Reload(t *testing.T) {
 	if err := d.Reload(context.Background()); err != nil {
 		t.Fatalf("Reload() err = %v", err)
 	}
-	defer d.Close()
 
 	if !d.Ready() {
 		t.Errorf("Ready() = false after Reload, want true")
 	}
 
-	sesh, release, err := d.Acquire()
-	if err != nil {
-		t.Fatalf("Acquire() err = %v", err)
+	// Nothing is due (SkipUpdate) and a db is already adopted, so a second
+	// Reload has nothing to do and must not fail.
+	if err := d.Reload(context.Background()); err != nil {
+		t.Fatalf("second Reload() err = %v", err)
 	}
-	defer release()
 
-	got, err := digestOf(t, sesh.Inner())
+	sesh := d.Acquire()
+	defer sesh.Close()
+	inner, err := sesh.Open()
+	if err != nil {
+		t.Fatalf("Open() err = %v", err)
+	}
+	got, err := digestOf(t, inner)
 	if err != nil {
 		t.Fatalf("GetMetadata() err = %v", err)
 	}
 	if want := "sha256:a"; got != want {
 		t.Errorf("digest = %v, want %v", got, want)
-	}
-
-	// The Session is borrowed: Close must leave the shared db alone, or the
-	// request that happened to finish first would take the db away from every
-	// other request and from the process.
-	sesh.Close()
-	if _, err := digestOf(t, sesh.Inner()); err != nil {
-		t.Errorf("GetMetadata() after borrowed Close err = %v, want the db to stay open", err)
-	}
-
-	// Nothing is due (SkipUpdate) and a db is already installed, so Reload has
-	// no reason to churn the handle.
-	if err := d.Reload(context.Background()); err != nil {
-		t.Fatalf("second Reload() err = %v", err)
-	}
-	sesh2, release2, err := d.Acquire()
-	if err != nil {
-		t.Fatalf("second Acquire() err = %v", err)
-	}
-	defer release2()
-	if sesh2.Inner() != sesh.Inner() {
-		t.Errorf("second Acquire() returned a different db, want the installed one to be reused")
-	}
-}
-
-func TestSharedDB_InstallKeepsRetiredGenerationOpenUntilReleased(t *testing.T) {
-	d, err := vuls2.NewSharedDB(config.Vuls2Conf{Path: newFixtureDB(t, "sha256:a"), SkipUpdate: true}, true)
-	if err != nil {
-		t.Fatalf("NewSharedDB() err = %v", err)
-	}
-	if err := d.Reload(context.Background()); err != nil {
-		t.Fatalf("Reload() err = %v", err)
-	}
-	defer d.Close()
-
-	old, releaseOld, err := d.Acquire()
-	if err != nil {
-		t.Fatalf("Acquire() err = %v", err)
-	}
-
-	// A refresh lands while a request is still reading: closing the db it is
-	// reading would munmap the file under its query, so the old generation has
-	// to outlive the install.
-	d.Install(openFixtureDB(t, newFixtureDB(t, "sha256:b")))
-
-	got, err := digestOf(t, old.Inner())
-	if err != nil {
-		t.Fatalf("GetMetadata() on the retired db err = %v, want it to stay readable", err)
-	}
-	if want := "sha256:a"; got != want {
-		t.Errorf("retired db digest = %v, want %v", got, want)
-	}
-
-	// A request arriving after the install gets the new db.
-	fresh, releaseFresh, err := d.Acquire()
-	if err != nil {
-		t.Fatalf("Acquire() after install err = %v", err)
-	}
-	defer releaseFresh()
-	got, err = digestOf(t, fresh.Inner())
-	if err != nil {
-		t.Fatalf("GetMetadata() on the installed db err = %v", err)
-	}
-	if want := "sha256:b"; got != want {
-		t.Errorf("installed db digest = %v, want %v", got, want)
-	}
-
-	// The last reader of a retired db closes it, so a swapped-out db is not
-	// leaked for the rest of the process's life.
-	inner := old.Inner()
-	releaseOld()
-	if _, err := digestOf(t, inner); err == nil {
-		t.Errorf("GetMetadata() on the released db err = nil, want the db to be closed")
 	}
 }
 
@@ -275,30 +261,38 @@ func TestSharedDB_ConcurrentAcquire(t *testing.T) {
 	if err := d.Reload(context.Background()); err != nil {
 		t.Fatalf("Reload() err = %v", err)
 	}
-	defer d.Close()
 
-	// Requests read the shared db concurrently while refreshes swap it under
-	// them: run under -race, this is what says the sharing is actually safe.
-	installed := newFixtureDB(t, "sha256:b")
-
+	// Requests open, read and close their own handles on the same file while
+	// health checks read Ready: under -race, this is what says that giving every
+	// request its own handle is safe. bolt takes a shared lock in read-only mode,
+	// so these opens do not serialise against each other.
 	var wg sync.WaitGroup
 	for range 8 {
 		wg.Go(func() {
 			for range 20 {
-				sesh, release, err := d.Acquire()
+				sesh := d.Acquire()
+				inner, err := sesh.Open()
 				if err != nil {
-					t.Errorf("Acquire() err = %v", err)
+					t.Errorf("Open() err = %v", err)
+					sesh.Close()
 					return
 				}
-				if _, err := digestOf(t, sesh.Inner()); err != nil {
-					t.Errorf("GetMetadata() err = %v, want the acquired db to stay open", err)
+				if _, err := digestOf(t, inner); err != nil {
+					t.Errorf("GetMetadata() err = %v, want the acquired db to be readable", err)
 				}
-				release()
+				sesh.Close()
 			}
 		})
 	}
 	for range 4 {
-		wg.Go(func() { d.Install(openFixtureDB(t, installed)) })
+		wg.Go(func() {
+			for range 50 {
+				if !d.Ready() {
+					t.Errorf("Ready() = false while serving, want true")
+					return
+				}
+			}
+		})
 	}
 	wg.Wait()
 }

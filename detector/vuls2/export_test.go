@@ -2,17 +2,17 @@ package vuls2
 
 import "github.com/MaineK00n/vuls2/pkg/db/session"
 
-// Install exposes SharedDB.install so tests can retire a generation without a
-// real fetch, which is the only way a new db reaches install in production.
-func (d *SharedDB) Install(sesh *session.Session) { d.install(sesh) }
+// Open exposes Session.open so tests can force the lazy open and inspect what
+// it produced.
+func (s *Session) Open() (*session.Session, error) { return s.open() }
 
-// Inner exposes the db a Session queries, so tests can tell which generation
-// they were handed and whether it is still open.
-func (s *Session) Inner() *session.Session { return s.sesh }
+// SkipsUpdate reports whether this Session is barred from downloading a db, so
+// a test can assert that the request path cannot fetch.
+func (s *Session) SkipsUpdate() bool { return s.vuls2Conf.SkipUpdate }
 
 var (
 	ShouldDownload = shouldDownload
-	MustFetchSync  = mustFetchSync
+	HasNewerRemote = hasNewerRemote
 
 	PreConvertPkgs   = preConvertPkgs
 	PreConvertCPEs   = preConvertCPEs

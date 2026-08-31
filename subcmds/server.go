@@ -128,19 +128,46 @@ func (p *ServerCmd) Execute(ctx context.Context, _ *flag.FlagSet, _ ...any) subc
 		return subcommands.ExitUsageError
 	}
 
-	if !config.Conf.Vuls2.SkipUpdate {
-		vuls2.StartInitialFetch(config.Conf.Vuls2, config.Conf.NoProgress)
+	// Own the vuls2 db here, for the whole process, rather than per request: a
+	// request must never be the thing that downloads a multi-gigabyte db, and
+	// every request should read the one db this process already has open.
+	// Progress bars are off unconditionally — a server's fetch reports itself
+	// through the log, and a bar redrawing itself into a container log is
+	// unreadable.
+	db, err := vuls2.NewSharedDB(config.Conf.Vuls2, true)
+	if err != nil {
+		logging.Log.Errorf("Failed to configure vuls2 db. err: %+v", err)
+		return subcommands.ExitFailure
 	}
 
-	http.Handle("/vuls", server.VulsHandler{
-		ToLocalFile: p.toLocalFile,
-	})
-	http.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
-		ok, msg := vuls2.Ready()
-		if !ok {
-			w.WriteHeader(http.StatusServiceUnavailable)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// Open the db in the background so the listener comes up right away and can
+	// say that it is still downloading, rather than the port simply being closed
+	// for the length of a multi-gigabyte fetch. Once a db is open, the same
+	// goroutine keeps it current, so a request never waits on a fetch and only
+	// one fetch ever runs at a time.
+	go func() {
+		if err := db.Prepare(ctx, dbRetryInterval); err != nil {
+			logging.Log.Errorf("Failed to prepare vuls2 db. err: %+v", err)
+			return
 		}
-		if _, err := fmt.Fprintf(w, "%s", msg); err != nil {
+		logging.Log.Infof("vuls2 db is ready")
+		db.Run(ctx, dbRefreshInterval)
+	}()
+
+	http.Handle("/vuls", server.NewVulsHandler(p.toLocalFile, db, p.maxConcurrency))
+	// /health reports whether this server can answer at all: with no db open,
+	// /vuls can only fail, so traffic should be kept away until it is. Point a
+	// readiness probe at it — a liveness probe would restart the process partway
+	// through the first fetch and start the download over from nothing.
+	http.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+		if !db.Ready() {
+			http.Error(w, "vuls2 db is not ready", http.StatusServiceUnavailable)
+			return
+		}
+		if _, err := fmt.Fprintf(w, "ok"); err != nil {
 			logging.Log.Errorf("Failed to print server health. err: %+v", err)
 		}
 	})

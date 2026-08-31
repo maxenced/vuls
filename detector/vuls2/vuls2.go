@@ -32,6 +32,9 @@ import (
 	segmentTypes "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data/detection/segment"
 	ecosystemTypes "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data/detection/segment/ecosystem"
 	severityTypes "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data/severity"
+	v2 "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data/severity/cvss/v2"
+	v31 "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data/severity/cvss/v31"
+	v40 "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data/severity/cvss/v40"
 	severityVendorTypes "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data/severity/vendor"
 	vulnerabilityContentTypes "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data/vulnerability/content"
 	datasourceTypes "github.com/MaineK00n/vuls-data-update/pkg/extract/types/datasource"
@@ -100,31 +103,32 @@ func DetectCPEs(r *models.ScanResult, cpes []CPE, sesh *Session) error {
 // Session is a vuls2 db handle scoped to one server's detection and
 // enrichment. Every path of that turn queries the same db, so the read cache
 // that OS-package / CPE detection warms is still warm for the enrichment that
-// immediately follows instead of being discarded and rebuilt.
+// immediately follows instead of being discarded and rebuilt. That cache is
+// what makes enrichment affordable: without it, every root that references an
+// advisory or a vulnerability re-reads and re-unmarshals the same record, which
+// measured ~60x slower on a 4873-CVE result (2.4s -> 150s).
 //
-// A Session comes in one of two flavours.
+// The db is opened lazily, on the first path that actually queries it: a family
+// that skips vuls2 detection (FreeBSD, pseudo, trivy-scanned, ...) does not open
+// it during detection, but enrichment still opens it when the result carries
+// CVEs (e.g. FreeBSD's pkg-audit findings); a server with nothing to detect and
+// no CVEs to enrich never opens it at all. Close releases the db.
 //
-// An owned Session (NewSession) opens the db itself, lazily, on the first path
-// that actually queries it — exactly as the unshared code did: a family that
-// skips vuls2 detection (FreeBSD, pseudo, trivy-scanned, ...) does not open it
-// during detection, but enrichment still opens it when the result carries CVEs
-// (e.g. FreeBSD's pkg-audit findings); a server with nothing to detect and no
-// CVEs to enrich never opens it at all. Close releases the db. This is the
-// report/detect path, where one run holds the db for as long as it needs it.
-//
-// A borrowed Session (SharedDB.Acquire) queries a db that a SharedDB opened
-// once for the whole process and keeps open across requests. Close is a no-op
-// on it — unpinning is the release func Acquire returns — and it carries no
-// read cache, because a cache that outlives a request would grow without
-// bound (see newDBConfig).
-//
-// Either way a single Session is not safe for concurrent use; one server's
-// detection runs sequentially, which is the intended scope. Server mode hands
-// each request its own borrowed Session over the shared db.
+// A Session is not safe for concurrent use; one server's detection runs
+// sequentially, which is the intended scope. Server mode gives each request its
+// own, from SharedDB.Acquire.
 type Session struct {
 	vuls2Conf  config.Vuls2Conf
 	noProgress bool
 	withCache  bool
+
+	// recordDigest records the db's digest on the global config when the db is
+	// opened, so the report this run produces says which db produced it. Server
+	// mode turns it off on the sessions it hands to requests: SharedDB has
+	// already recorded the digest of the db they are about to open, and letting
+	// concurrent requests write a global that detector.DetectPkgCves reads would
+	// be a data race.
+	recordDigest bool
 
 	sesh *session.Session
 
@@ -133,10 +137,10 @@ type Session struct {
 	borrowed bool
 }
 
-// NewSession returns a not-yet-opened owned Session; the db is opened lazily
-// on the first path that queries it (see Session).
+// NewSession returns a not-yet-opened Session; the db is opened lazily on the
+// first path that queries it (see Session).
 func NewSession(vuls2Conf config.Vuls2Conf, noProgress bool) *Session {
-	return &Session{vuls2Conf: vuls2Conf, noProgress: noProgress, withCache: true}
+	return &Session{vuls2Conf: vuls2Conf, noProgress: noProgress, withCache: true, recordDigest: true}
 }
 
 // open opens the db on the first call and reuses the connection on every later
@@ -154,19 +158,22 @@ func (s *Session) open() (*session.Session, error) {
 		return nil, xerrors.Errorf("db session is nil; create one with NewSession")
 	}
 	if s.sesh == nil {
-		sesh, err := openSession(s.vuls2Conf, s.noProgress, s.withCache)
+		sesh, digest, err := openSession(s.vuls2Conf, s.noProgress, s.withCache)
 		if err != nil {
 			return nil, xerrors.Errorf("Failed to open db session. err: %w", err)
+		}
+		if s.recordDigest {
+			config.Conf.Vuls2.Digest = digest
 		}
 		s.sesh = sesh
 	}
 	return s.sesh, nil
 }
 
-// Close releases the db storage and cache if this Session owns and opened one.
-// It is a no-op on a nil, never-opened or borrowed Session, and clears the
-// handle afterwards so a second Close (or a stray open) neither double-closes
-// nor reuses a closed session — always safe to defer.
+// Close releases the db storage and cache if this Session opened one. It is a
+// no-op on a nil or never-opened Session, and clears the handle afterwards so a
+// second Close (or a stray open) neither double-closes nor reuses a closed
+// session — always safe to defer.
 func (s *Session) Close() {
 	if s == nil || s.sesh == nil || s.borrowed {
 		return
@@ -197,45 +204,110 @@ func withDefaults(vuls2Conf config.Vuls2Conf) (config.Vuls2Conf, error) {
 
 // openSession opens a vuls2 db session: it fills in the default
 // repository/path, downloads or refreshes the db if due and validates the
-// schema version (both inside newDBConfig), opens storage, and records the db
-// digest on the global config. withCache is passed through to newDBConfig,
-// which documents when a read cache is safe to carry. The caller owns the
-// returned session and must close its Storage() and Cache().
-func openSession(vuls2Conf config.Vuls2Conf, noProgress, withCache bool) (*session.Session, error) {
+// schema version (both inside newDBConfig), and opens storage. withCache is
+// passed through to newDBConfig, which documents when a read cache is worth
+// carrying. The caller owns the returned session and must close its Storage()
+// and Cache().
+//
+// The db's digest comes back alongside the session rather than being recorded
+// on the global config here, because who may write that global depends on the
+// caller: a report run is alone in the process, while a server has concurrent
+// requests reading it and records it once, from the goroutine that owns the db.
+func openSession(vuls2Conf config.Vuls2Conf, noProgress, withCache bool) (*session.Session, *string, error) {
 	vuls2Conf, err := withDefaults(vuls2Conf)
 	if err != nil {
-		return nil, xerrors.Errorf("Failed to apply vuls2 config defaults. err: %w", err)
+		return nil, nil, xerrors.Errorf("Failed to apply vuls2 config defaults. err: %w", err)
 	}
 
 	dbConfig, err := newDBConfig(vuls2Conf, noProgress, withCache)
 	if err != nil {
-		return nil, xerrors.Errorf("Failed to get new db connection. err: %w", err)
+		return nil, nil, xerrors.Errorf("Failed to get new db connection. err: %w", err)
 	}
 
 	sesh, err := dbConfig.New()
 	if err != nil {
-		return nil, xerrors.Errorf("Failed to new db session. err: %w", err)
+		return nil, nil, xerrors.Errorf("Failed to new db session. err: %w", err)
 	}
 
 	if err := sesh.Storage().Open(); err != nil {
 		sesh.Cache().Close()
-		return nil, xerrors.Errorf("Failed to open db. err: %w", err)
+		return nil, nil, xerrors.Errorf("Failed to open db. err: %w", err)
 	}
 
 	metadata, err := sesh.Storage().GetMetadata()
 	if err != nil {
 		_ = sesh.Storage().Close()
 		sesh.Cache().Close()
-		return nil, xerrors.Errorf("Failed to get metadata. err: %w", err)
+		return nil, nil, xerrors.Errorf("Failed to get metadata. err: %w", err)
 	}
 	if metadata == nil {
 		_ = sesh.Storage().Close()
 		sesh.Cache().Close()
-		return nil, xerrors.Errorf("unexpected vuls2 db metadata. metadata: nil, path: %s", vuls2Conf.Path)
+		return nil, nil, xerrors.Errorf("unexpected vuls2 db metadata. metadata: nil, path: %s", vuls2Conf.Path)
 	}
-	config.Conf.Vuls2.Digest = metadata.Digest
 
-	return sesh, nil
+	return sesh, metadata.Digest, nil
+}
+
+// warningMessages renders the non-fatal evaluation warnings recorded on the
+// FilteredCriteria trees (data this build could not evaluate, e.g. produced
+// by a newer vuls-data-update) into scan-result warning lines. vuls2 hands
+// the trees over ungated, with out-of-vocabulary criterions carrying their
+// recorded warnings, so even a condition whose every criterion was skipped
+// is represented — postConvert's affected gating works on its own derived
+// data and never prunes these trees. One line per distinct
+// (source, warning), deduplicated with the upstream warning.Compare: each
+// line renders deterministically on its own, so callers can deduplicate
+// across passes by comparing the rendered strings. The source leads the
+// format on purpose — ScanResult.SortForJSONOutput orders the lines
+// lexicographically, so a drifting source's lines cluster together, then
+// by kind and cause. An empty Cause (the raw value for an unset datum, or
+// the constant for cause-less kinds like empty-range) is not rendered.
+// Line order here is unspecified — SortForJSONOutput normalizes it.
+func warningMessages(detected []detectTypes.VulnerabilityData) []string {
+	type entry struct {
+		source  sourceTypes.SourceID
+		warning warningTypes.Warning
+	}
+	var entries []entry
+	var collect func(fca criteriaTypes.FilteredCriteria, sid sourceTypes.SourceID)
+	collect = func(fca criteriaTypes.FilteredCriteria, sid sourceTypes.SourceID) {
+		for _, ca := range fca.Criterias {
+			collect(ca, sid)
+		}
+		for _, cn := range fca.Criterions {
+			for _, w := range cn.Warnings {
+				e := entry{source: sid, warning: w}
+				if !slices.ContainsFunc(entries, func(x entry) bool {
+					return x.source == e.source && warningTypes.Compare(x.warning, e.warning) == 0
+				}) {
+					entries = append(entries, e)
+				}
+			}
+		}
+	}
+	for _, data := range detected {
+		for _, d := range data.Detections {
+			for sid, conds := range d.Contents {
+				for _, cond := range conds {
+					collect(cond.Criteria, sid)
+				}
+			}
+		}
+	}
+	msgs := make([]string, 0, len(entries))
+	for _, e := range entries {
+		var parts []string
+		if e.source != "" {
+			parts = append(parts, fmt.Sprintf("source: %s", e.source))
+		}
+		parts = append(parts, fmt.Sprintf("kind: %s", e.warning.Kind))
+		if e.warning.Cause != "" {
+			parts = append(parts, fmt.Sprintf("cause: %q", e.warning.Cause))
+		}
+		msgs = append(msgs, fmt.Sprintf("vuls2 skipped data it cannot evaluate (%s). Detection may be incomplete; updating vuls may resolve this.", strings.Join(parts, ", ")))
+	}
+	return msgs
 }
 
 // warningMessages renders the non-fatal evaluation warnings recorded on the
@@ -400,15 +472,19 @@ func mergeIntoScannedCves(r *models.ScanResult, vulnInfos models.VulnInfos) {
 			// types), so they cannot collide with each other. A caller-provided
 			// base (or the go-cve-dictionary pass) may already carry the same
 			// type for this CVE, though — vuls2 now emits Nvd/Jvn contents — so
-			// dedup on the (type, CVE, source link) identity before appending,
-			// mirroring the key-based dedup the sibling merges above use, to
-			// avoid repeating a source/link in reports. Reconciling genuinely
-			// conflicting contents of one source (e.g. differing CVSS) is out
-			// of scope: the existing entry is kept.
+			// dedup on the (type, CVE, source link, CVSS/CWE source) identity
+			// before appending, mirroring the key-based dedup the sibling
+			// merges above use, to avoid repeating a source/link in reports.
+			// The CVSS/CWE source belongs in that identity because the
+			// per-source contents of one type (nvd's own analysis and the
+			// CNA's) share a source link, and keying on the link alone would
+			// drop all but the first. Reconciling genuinely conflicting
+			// contents of one source (e.g. differing CVSS) is out of scope: the
+			// existing entry is kept.
 			for ccType, ccs := range vi.CveContents {
 				for _, cc := range ccs {
 					if slices.ContainsFunc(viBase.CveContents[ccType], func(e models.CveContent) bool {
-						return e.Type == cc.Type && e.CveID == cc.CveID && e.SourceLink == cc.SourceLink
+						return e.Type == cc.Type && e.CveID == cc.CveID && e.SourceLink == cc.SourceLink && e.Optional["source"] == cc.Optional["source"]
 					}) {
 						continue
 					}
@@ -1802,49 +1878,64 @@ func walkVulnerabilityDatas(m map[source]sourceData, vds []detectTypes.Vulnerabi
 								}
 							}
 
+							cc := models.CveContent{
+								Type:           cctype,
+								CveID:          string(v.Content.ID),
+								Title:          v.Content.Title,
+								Summary:        v.Content.Description,
+								Cvss2Score:     cvss2.BaseScore,
+								Cvss2Vector:    cvss2.Vector,
+								Cvss2Severity:  cvss2.NVDBaseSeverity,
+								Cvss3Score:     cvss3.BaseScore,
+								Cvss3Vector:    cvss3.Vector,
+								Cvss3Severity:  cvss3.BaseSeverity,
+								Cvss40Score:    cvss40.Score,
+								Cvss40Vector:   cvss40.Vector,
+								Cvss40Severity: cvss40.Severity,
+								SourceLink:     cveContentSourceLink(cctype, v, src.RootID),
+								References:     rs,
+								CweIDs: func() []string {
+									var cs []string
+									for _, cwe := range v.Content.CWE {
+										cs = append(cs, cwe.CWE...)
+									}
+									return cs
+								}(),
+								Published: func() time.Time {
+									if v.Content.Published != nil {
+										return *v.Content.Published
+									}
+									return time.Date(1000, time.January, 1, 0, 0, 0, 0, time.UTC)
+								}(),
+								LastModified: func() time.Time {
+									if v.Content.Modified != nil {
+										return *v.Content.Modified
+									}
+									return time.Date(1000, time.January, 1, 0, 0, 0, 0, time.UTC)
+								}(),
+								Optional: cveContentOptional(src.Segment.Ecosystem, v, string(bs)),
+							}
+
+							// NVD and VulnCheck carry both the CNA's metrics and
+							// their own, so they are reported as one CveContent
+							// per CVSS/CWE source; every other source publishes a
+							// single set and stays a single content.
+							ccs := []models.CveContent{cc}
+							switch cctype {
+							case models.Nvd, models.Vulncheck:
+								ccs = splitCveContentBySource(cc, v.Content.Severity, v.Content.CWE, func(ss []severityTypes.Severity) (v2.CVSSv2, v31.CVSSv31, v40.CVSSv40) {
+									return toCvss(src.Segment.Ecosystem, sid, ss)
+								})
+							default:
+							}
+
 							return models.VulnInfo{
 								CveID:            string(v.Content.ID),
 								Confidences:      models.Confidences{toVuls0Confidence(src.Segment.Ecosystem, src.SourceID, sd)},
 								DistroAdvisories: fdas,
 								Exploits:         exploits,
 								Mitigations:      mitigations,
-								CveContents: models.NewCveContents(models.CveContent{
-									Type:           cctype,
-									CveID:          string(v.Content.ID),
-									Title:          v.Content.Title,
-									Summary:        v.Content.Description,
-									Cvss2Score:     cvss2.BaseScore,
-									Cvss2Vector:    cvss2.Vector,
-									Cvss2Severity:  cvss2.NVDBaseSeverity,
-									Cvss3Score:     cvss3.BaseScore,
-									Cvss3Vector:    cvss3.Vector,
-									Cvss3Severity:  cvss3.BaseSeverity,
-									Cvss40Score:    cvss40.Score,
-									Cvss40Vector:   cvss40.Vector,
-									Cvss40Severity: cvss40.Severity,
-									SourceLink:     cveContentSourceLink(cctype, v, src.RootID),
-									References:     rs,
-									CweIDs: func() []string {
-										var cs []string
-										for _, cwe := range v.Content.CWE {
-											cs = append(cs, cwe.CWE...)
-										}
-										return cs
-									}(),
-									Published: func() time.Time {
-										if v.Content.Published != nil {
-											return *v.Content.Published
-										}
-										return time.Date(1000, time.January, 1, 0, 0, 0, 0, time.UTC)
-									}(),
-									LastModified: func() time.Time {
-										if v.Content.Modified != nil {
-											return *v.Content.Modified
-										}
-										return time.Date(1000, time.January, 1, 0, 0, 0, 0, time.UTC)
-									}(),
-									Optional: cveContentOptional(src.Segment.Ecosystem, v, string(bs)),
-								}),
+								CveContents:      models.NewCveContents(ccs...),
 							}, nil
 						}()
 						if err != nil {
@@ -1998,12 +2089,26 @@ func mergeVulnInfo(a, b models.VulnInfo) (models.VulnInfo, error) {
 	}
 	info.DistroAdvisories = slices.Collect(maps.Values(am))
 
-	ccm := make(map[models.CveContentType]models.CveContent)
+	// Contents of one type stay in the order they arrive in; like the enrich
+	// passes, this leaves ordering to CveContents.Sort (see
+	// ScanResult.SortForJSONOutput) rather than imposing one of its own.
+	ccs := make(models.CveContents)
 	for _, cciter := range []iter.Seq[[]models.CveContent]{maps.Values(a.CveContents), maps.Values(b.CveContents)} {
 		for cc := range cciter {
 			for _, c := range cc {
-				base, ok := ccm[c.Type]
-				if ok {
+				// A type can hold several contents, one per CVSS/CWE source
+				// (nvd/vulncheck report both the CNA's metrics and their own,
+				// mitre one per CNA/ADP container). Those are separate metric
+				// sets rather than rival reports of the same one, so a content
+				// merges only into one of the same source — merging across
+				// sources would fabricate a set no source published. The
+				// source is empty for every single-content type, which leaves
+				// their merging keyed by type alone as before.
+				i := slices.IndexFunc(ccs[c.Type], func(e models.CveContent) bool {
+					return e.Optional["source"] == c.Optional["source"]
+				})
+				if i >= 0 {
+					base := ccs[c.Type][i]
 					var src1 []source
 					if err := json.Unmarshal([]byte(base.Optional["vuls2-sources"]), &src1); err != nil {
 						return models.VulnInfo{}, xerrors.Errorf("Failed to unmarshal sources. err: %w", err)
@@ -2109,17 +2214,12 @@ func mergeVulnInfo(a, b models.VulnInfo) (models.VulnInfo, error) {
 					}
 					merged.Optional["vuls2-sources"] = string(bs)
 
-					base = merged
+					ccs[c.Type][i] = merged
 				} else {
-					base = c
+					ccs[c.Type] = append(ccs[c.Type], c)
 				}
-				ccm[c.Type] = base
 			}
 		}
-	}
-	ccs := make(models.CveContents)
-	for cctype, cc := range ccm {
-		ccs[cctype] = []models.CveContent{cc}
 	}
 	info.CveContents = ccs
 
