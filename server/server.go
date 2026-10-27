@@ -50,6 +50,22 @@ func NewVulsHandler(toLocalFile bool, db *vuls2.SharedDB, maxConcurrency int) *V
 	return h
 }
 
+// cpesFromRequest returns the CPEs the request asks to detect: the cpeNames of
+// the scanned server in the payload's config.scan.servers, nil when it lists
+// none. JVN is kept for every one of them, as `vuls report` does for
+// config-sourced CPEs.
+func cpesFromRequest(r models.ScanResult) []vuls2.CPE {
+	serverInfo, ok := r.Config.Scan.Servers[r.ServerName]
+	if !ok || len(serverInfo.CpeNames) == 0 {
+		return nil
+	}
+	cpes := make([]vuls2.CPE, 0, len(serverInfo.CpeNames))
+	for _, uri := range serverInfo.CpeNames {
+		cpes = append(cpes, vuls2.CPE{URI: uri, UseJVN: true})
+	}
+	return cpes
+}
+
 // ServeHTTP is http handler
 func (h *VulsHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	var err error
@@ -122,6 +138,19 @@ func (h *VulsHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		logging.Log.Errorf("Failed to detect Pkg CVE: %+v", err)
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
+	}
+
+	// A client that wants CPE detection on top of the package detection lists
+	// its CPEs in config.scan.servers.<serverName>.cpeNames, the same place a
+	// scan result carries them for `vuls report`. The server never reads
+	// config.toml for a request, so nothing else declares them.
+	if cpes := cpesFromRequest(r); len(cpes) > 0 {
+		logging.Log.Infof("%s: detecting CVEs of %d CPEs from the request", r.FormatServerName(), len(cpes))
+		if err := detector.DetectCpeURIsCves(&r, cpes, sesh); err != nil {
+			logging.Log.Errorf("Failed to detect CPE CVE: %+v", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 	}
 
 	if err := vuls2.EnrichVulnInfos(&r, sesh); err != nil {
