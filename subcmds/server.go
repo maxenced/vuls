@@ -39,6 +39,7 @@ type ServerCmd struct {
 	configPath     string
 	listen         string
 	toLocalFile    bool
+	sparse         bool
 	maxConcurrency int
 }
 
@@ -61,6 +62,7 @@ func (*ServerCmd) Usage() string {
 		[-ignore-unscored-cves]
 		[-ignore-unfixed]
 		[-to-localfile]
+		[-sparse]
 		[-http-proxy=http://192.168.0.1:8080]
 		[-debug]
 		[-debug-sql]
@@ -104,6 +106,8 @@ func (p *ServerCmd) SetFlags(f *flag.FlagSet) {
 		"http://proxy-url:port (default: empty)")
 
 	f.BoolVar(&p.toLocalFile, "to-localfile", false, "Write report to localfile")
+	f.BoolVar(&p.sparse, "sparse", false,
+		"Keep only the IDs, CVSS scores, vectors and severities of each cveContent in the response, overridable per request with ?sparse=true|false")
 	f.StringVar(&p.listen, "listen", "localhost:5515",
 		"host:port (default: localhost:5515)")
 
@@ -157,7 +161,7 @@ func (p *ServerCmd) Execute(ctx context.Context, _ *flag.FlagSet, _ ...any) subc
 		db.Run(ctx, dbRefreshInterval)
 	}()
 
-	http.Handle("/vuls", server.NewVulsHandler(p.toLocalFile, db, p.maxConcurrency))
+	http.Handle("/vuls", server.NewVulsHandler(p.toLocalFile, p.sparse, db, p.maxConcurrency))
 	// /health reports whether this server can answer at all: with no db open,
 	// /vuls can only fail, so traffic should be kept away until it is. Point a
 	// readiness probe at it — a liveness probe would restart the process partway

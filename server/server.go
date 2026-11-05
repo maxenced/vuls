@@ -24,6 +24,11 @@ import (
 type VulsHandler struct {
 	ToLocalFile bool
 
+	// Sparse is the server's default for whether a response keeps only the IDs,
+	// CVSS scores, vectors and severities of each cveContent. A request
+	// overrides it with its sparse query parameter.
+	Sparse bool
+
 	// DB owns the vuls2 db for the lifetime of the process: it downloads it and
 	// keeps it current in the background, and hands each request a session that
 	// can only read what is already on disk. Nothing here downloads a db.
@@ -42,8 +47,8 @@ type VulsHandler struct {
 
 // NewVulsHandler returns the /vuls handler. maxConcurrency caps concurrent
 // detections; 0 or less leaves them unbounded.
-func NewVulsHandler(toLocalFile bool, db *vuls2.SharedDB, maxConcurrency int) *VulsHandler {
-	h := &VulsHandler{ToLocalFile: toLocalFile, DB: db}
+func NewVulsHandler(toLocalFile, sparse bool, db *vuls2.SharedDB, maxConcurrency int) *VulsHandler {
+	h := &VulsHandler{ToLocalFile: toLocalFile, Sparse: sparse, DB: db}
 	if maxConcurrency > 0 {
 		h.sem = make(chan struct{}, maxConcurrency)
 	}
@@ -70,6 +75,15 @@ func cpesFromRequest(r models.ScanResult) []vuls2.CPE {
 func (h *VulsHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	var err error
 	r := models.ScanResult{ScannedCves: models.VulnInfos{}}
+
+	// Settled before reading the body: a malformed parameter is the client's
+	// error, and nothing should be detected for a response it cannot get.
+	sparse, err := sparseRequested(h.Sparse, req.URL.Query())
+	if err != nil {
+		logging.Log.Error(err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	contentType := req.Header.Get("Content-Type")
 	mediatype, _, err := mime.ParseMediaType(contentType)
@@ -189,9 +203,13 @@ func (h *VulsHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	// report
-	reports := []reporter.ResultWriter{
-		reporter.HTTPResponseWriter{Writer: w},
+	// Only the response is sparse: a result written with -to-localfile is the
+	// server's archive and stays complete.
+	var resp reporter.ResultWriter = reporter.HTTPResponseWriter{Writer: w}
+	if sparse {
+		resp = sparseResponseWriter{Writer: w}
 	}
+	reports := []reporter.ResultWriter{resp}
 	if h.ToLocalFile {
 		scannedAt := r.ScannedAt
 		if scannedAt.IsZero() {
