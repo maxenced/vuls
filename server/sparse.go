@@ -16,33 +16,46 @@ import (
 // sparseCveContent is the part of a models.CveContent a sparse response keeps:
 // which source it comes from and how it scores the CVE. Summary, references,
 // CPEs, CWEs and the rest are what make a full response heavy, and are left
-// out. Field names and JSON tags match models.CveContent, so a client decoding
-// a sparse response into models.ScanResult reads these fields unchanged and
-// finds the others empty.
+// out. A score, vector or severity the source does not give is left out too,
+// rather than written as 0 or "". Field names and JSON tags match
+// models.CveContent, so a client decoding a sparse response into
+// models.ScanResult reads these fields unchanged and finds the others empty.
 type sparseCveContent struct {
 	Type           models.CveContentType `json:"type"`
 	CveID          string                `json:"cveID"`
-	Cvss2Score     float64               `json:"cvss2Score"`
-	Cvss2Vector    string                `json:"cvss2Vector"`
-	Cvss2Severity  string                `json:"cvss2Severity"`
-	Cvss3Score     float64               `json:"cvss3Score"`
-	Cvss3Vector    string                `json:"cvss3Vector"`
-	Cvss3Severity  string                `json:"cvss3Severity"`
-	Cvss40Score    float64               `json:"cvss40Score"`
-	Cvss40Vector   string                `json:"cvss40Vector"`
-	Cvss40Severity string                `json:"cvss40Severity"`
+	Cvss2Score     float64               `json:"cvss2Score,omitempty"`
+	Cvss2Vector    string                `json:"cvss2Vector,omitempty"`
+	Cvss2Severity  string                `json:"cvss2Severity,omitempty"`
+	Cvss3Score     float64               `json:"cvss3Score,omitempty"`
+	Cvss3Vector    string                `json:"cvss3Vector,omitempty"`
+	Cvss3Severity  string                `json:"cvss3Severity,omitempty"`
+	Cvss40Score    float64               `json:"cvss40Score,omitempty"`
+	Cvss40Vector   string                `json:"cvss40Vector,omitempty"`
+	Cvss40Severity string                `json:"cvss40Severity,omitempty"`
 }
 
-// sparseVulnInfo is a models.VulnInfo whose cveContents are sparse. The outer
-// CveContents is less nested than the embedded one, so encoding/json marshals
-// it in place of VulnInfo.CveContents under the same key.
+// sparseExploit is a models.Exploit without its description, which mostly
+// repeats the CVE summary. The outer Description is less nested than the
+// embedded one, so encoding/json marshals it in place of
+// Exploit.Description, and toSparse leaves it empty so omitempty drops it.
+// The other fields are models.Exploit's, under the same JSON tags.
+type sparseExploit struct {
+	models.Exploit
+	Description string `json:"description,omitempty"`
+}
+
+// sparseVulnInfo is a models.VulnInfo whose cveContents and exploits are
+// sparse. The outer CveContents and Exploits are less nested than the embedded
+// ones, so encoding/json marshals them in place of VulnInfo.CveContents and
+// VulnInfo.Exploits under the same keys.
 type sparseVulnInfo struct {
 	models.VulnInfo
 	CveContents map[models.CveContentType][]sparseCveContent `json:"cveContents,omitempty"`
+	Exploits    []sparseExploit                              `json:"exploits,omitempty"`
 }
 
 // sparseScanResult is a models.ScanResult whose scannedCves carry sparse
-// cveContents, the same shadowing as sparseVulnInfo.
+// cveContents and exploits, the same shadowing as sparseVulnInfo.
 type sparseScanResult struct {
 	models.ScanResult
 	ScannedCves map[string]sparseVulnInfo `json:"scannedCves"`
@@ -74,7 +87,14 @@ func toSparse(r models.ScanResult) sparseScanResult {
 				conts[typ] = scs
 			}
 		}
-		vinfos[id] = sparseVulnInfo{VulnInfo: v, CveContents: conts}
+		var exploits []sparseExploit
+		if len(v.Exploits) > 0 {
+			exploits = make([]sparseExploit, 0, len(v.Exploits))
+			for _, e := range v.Exploits {
+				exploits = append(exploits, sparseExploit{Exploit: e})
+			}
+		}
+		vinfos[id] = sparseVulnInfo{VulnInfo: v, CveContents: conts, Exploits: exploits}
 	}
 	return sparseScanResult{ScanResult: r, ScannedCves: vinfos}
 }
@@ -95,7 +115,7 @@ func sparseRequested(def bool, q url.Values) (bool, error) {
 
 // sparseResponseWriter writes results to the HTTP response as
 // reporter.HTTPResponseWriter does, a JSON array of scan results, with sparse
-// cveContents.
+// cveContents and exploits.
 type sparseResponseWriter struct {
 	Writer http.ResponseWriter
 }

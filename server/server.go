@@ -24,9 +24,10 @@ import (
 type VulsHandler struct {
 	ToLocalFile bool
 
-	// Sparse is the server's default for whether a response keeps only the IDs,
-	// CVSS scores, vectors and severities of each cveContent. A request
-	// overrides it with its sparse query parameter.
+	// Sparse is the server's default for whether a response keeps only the IDs
+	// and the non-empty CVSS scores, vectors and severities of each cveContent,
+	// and drops the description of each exploit. A request overrides it with
+	// its sparse query parameter.
 	Sparse bool
 
 	// DB owns the vuls2 db for the lifetime of the process: it downloads it and

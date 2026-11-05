@@ -107,7 +107,7 @@ func (p *ServerCmd) SetFlags(f *flag.FlagSet) {
 
 	f.BoolVar(&p.toLocalFile, "to-localfile", false, "Write report to localfile")
 	f.BoolVar(&p.sparse, "sparse", false,
-		"Keep only the IDs, CVSS scores, vectors and severities of each cveContent in the response, overridable per request with ?sparse=true|false")
+		"Keep only the IDs and the non-empty CVSS scores, vectors and severities of each cveContent, and drop exploit descriptions, in the response, overridable per request with ?sparse=true|false")
 	f.StringVar(&p.listen, "listen", "localhost:5515",
 		"host:port (default: localhost:5515)")
 

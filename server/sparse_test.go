@@ -13,10 +13,13 @@ import (
 	"time"
 
 	"github.com/future-architect/vuls/models"
+	"github.com/future-architect/vuls/reporter"
 )
 
 func fullScanResult() models.ScanResult {
 	published := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+	verified := true
+	docURL := "https://example.com/exploit-doc"
 	return models.ScanResult{
 		ServerName: "host1",
 		Family:     "ubuntu",
@@ -27,6 +30,14 @@ func fullScanResult() models.ScanResult {
 				Confidences:      models.Confidences{models.OvalMatch},
 				AffectedPackages: models.PackageFixStatuses{{Name: "openssl", FixedIn: "3.0.2-0ubuntu1.15"}},
 				DistroAdvisories: models.DistroAdvisories{{AdvisoryID: "USN-1234-1", Severity: "high"}},
+				Exploits: models.Exploits{{
+					ExploitType: models.ExploitTypeTrickest,
+					ID:          "EDB-1",
+					URL:         "https://example.com/exploit",
+					Description: "an exploit description",
+					Verified:    &verified,
+					DocumentURL: &docURL,
+				}},
 				CveContents: models.CveContents{
 					models.Nvd: {{
 						Type:           models.Nvd,
@@ -56,6 +67,11 @@ func fullScanResult() models.ScanResult {
 						CveID:         "CVE-2024-0001",
 						Summary:       "ubuntu summary",
 						Cvss3Severity: "medium",
+					}},
+					models.Euvd: {{
+						Type:    models.Euvd,
+						CveID:   "CVE-2024-0001",
+						Summary: "euvd summary",
 					}},
 				},
 			},
@@ -105,6 +121,10 @@ func TestToSparse(t *testing.T) {
 			CveID:         "CVE-2024-0001",
 			Cvss3Severity: "medium",
 		}},
+		models.Euvd: {{
+			Type:  models.Euvd,
+			CveID: "CVE-2024-0001",
+		}},
 	}
 	if !reflect.DeepEqual(v.CveContents, wantConts) {
 		t.Errorf("CveContents = %+v, want %+v", v.CveContents, wantConts)
@@ -112,6 +132,45 @@ func TestToSparse(t *testing.T) {
 
 	if conts := got.ScannedCves["CVE-2024-0002"].CveContents; conts != nil {
 		t.Errorf("CVE without cveContents got %+v, want nil", conts)
+	}
+
+	wantExploits := []sparseExploit{{Exploit: want.Exploits[0]}}
+	if !reflect.DeepEqual(v.Exploits, wantExploits) {
+		t.Errorf("Exploits = %+v, want %+v", v.Exploits, wantExploits)
+	}
+	if es := got.ScannedCves["CVE-2024-0002"].Exploits; es != nil {
+		t.Errorf("CVE without exploits got %+v, want nil", es)
+	}
+}
+
+func TestSparseCveContentOmitsEmptyScores(t *testing.T) {
+	b, err := json.Marshal(sparseCveContent{Type: models.Euvd, CveID: "CVE-2002-1157"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"type":"euvd","cveID":"CVE-2002-1157"}`; string(b) != want {
+		t.Errorf("Marshal() = %s, want %s", b, want)
+	}
+}
+
+func TestFullResponseUnchanged(t *testing.T) {
+	in := fullScanResult()
+	rec := httptest.NewRecorder()
+	if err := (reporter.HTTPResponseWriter{Writer: rec}).Write(in); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	want, err := json.Marshal([]models.ScanResult{in})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Body.String() != string(want) {
+		t.Errorf("full response differs from the marshaled models.ScanResult")
+	}
+	body := rec.Body.String()
+	for _, kept := range []string{"an exploit description", "a long summary", `"cvss2Score":0`, `"cvss3Vector":""`} {
+		if !strings.Contains(body, kept) {
+			t.Errorf("full response lacks %q", kept)
+		}
 	}
 }
 
@@ -126,7 +185,7 @@ func TestSparseResponseWriter(t *testing.T) {
 		t.Errorf("Content-Type = %q, want application/json", ct)
 	}
 	body := rec.Body.String()
-	for _, dropped := range []string{"a long summary", "ubuntu summary", "a title", "example.com/advisory", "CWE-400", "cpe:/a:openssl", "sourceLink", "ssvc", "optional", "published"} {
+	for _, dropped := range []string{"a long summary", "ubuntu summary", "euvd summary", "an exploit description", `"cvss2Score":0`, `"cvss3Vector":""`, `"cvss40Severity":""`, "a title", "example.com/advisory", "CWE-400", "cpe:/a:openssl", "sourceLink", "ssvc", "optional", "published"} {
 		if strings.Contains(body, dropped) {
 			t.Errorf("sparse response still contains %q", dropped)
 		}
@@ -134,6 +193,14 @@ func TestSparseResponseWriter(t *testing.T) {
 	// The embedded VulnInfo.CveContents must be shadowed, not marshaled alongside.
 	if n := strings.Count(body, `"cveContents"`); n != 1 {
 		t.Errorf("found %d cveContents keys, want 1", n)
+	}
+	if n := strings.Count(body, `"exploits"`); n != 1 {
+		t.Errorf("found %d exploits keys, want 1", n)
+	}
+	for _, kept := range []string{`"url":"https://example.com/exploit"`, `"id":"EDB-1"`, `"exploitType":"Trickest"`, `"verified":true`, `"documentURL":"https://example.com/exploit-doc"`, `{"type":"euvd","cveID":"CVE-2024-0001"}`} {
+		if !strings.Contains(body, kept) {
+			t.Errorf("sparse response lacks %s", kept)
+		}
 	}
 
 	// A client decoding into the vuls models reads the kept fields unchanged.
@@ -164,6 +231,11 @@ func TestSparseResponseWriter(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got.AffectedPackages, in.ScannedCves["CVE-2024-0001"].AffectedPackages) {
 		t.Errorf("decoded affectedPackages = %+v", got.AffectedPackages)
+	}
+	wantExploit := in.ScannedCves["CVE-2024-0001"].Exploits[0]
+	wantExploit.Description = ""
+	if !reflect.DeepEqual(got.Exploits, models.Exploits{wantExploit}) {
+		t.Errorf("decoded exploits = %+v, want %+v", got.Exploits, wantExploit)
 	}
 	if rs[0].ServerName != "host1" {
 		t.Errorf("decoded serverName = %q, want host1", rs[0].ServerName)
